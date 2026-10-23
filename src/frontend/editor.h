@@ -37,6 +37,8 @@ enum EDITOR_COMMAND
   EDIT_RESUME,
   EDIT_RERUN,
   EDIT_RERUN_ONCE,
+  // research-editor fork: send one page as a PNG image.
+  EDIT_RENDER_PAGE,
 };
 
 struct editor_change
@@ -136,6 +138,14 @@ struct editor_command
 
     struct {
     } rerun_once;
+
+    // research-editor fork. id: a number that the reply repeats.
+    // page: the page index (0 is the first page). width: the image width in pixels.
+    struct {
+      int id;
+      int page;
+      float width;
+    } render_page;
   };
 };
 
@@ -170,5 +180,14 @@ void editor_notify_lookup(const char *path,
                           int len,
                           bool read,
                           enum EDITOR_LOOKUP_STATUS status);
+
+// research-editor fork: the reply to render-page.
+// page is -1 when the document has no such page. count: the pages that the
+// engine has now. done: the engine is at the end of the document, so count is
+// final. png: the image, or NULL. draw_ms and png_ms: the time to draw the
+// page into pixels and the time to encode the pixels as PNG.
+void editor_page(int id, int page, int count, bool done,
+                 int width, int height, fz_buffer *png,
+                 float draw_ms, float png_ms);
 
 #endif  // EDITOR_H_

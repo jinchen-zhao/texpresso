@@ -925,6 +925,133 @@ static void display_page(struct persistent_state *ps, ui_state *ui)
   schedule_event(RENDER_EVENT);
 }
 
+/* research-editor fork: render-page */
+
+#include <zlib.h>
+
+static void png_chunk(fz_context *ctx, fz_buffer *out, const char *type,
+                      const unsigned char *data, size_t len)
+{
+  unsigned char head[8] = {len >> 24, len >> 16, len >> 8, len,
+                           type[0], type[1], type[2], type[3]};
+  fz_append_data(ctx, out, head, 8);
+  if (len)
+    fz_append_data(ctx, out, data, len);
+  uLong crc = crc32(crc32(0, (const Bytef *)type, 4), data, len);
+  unsigned char tail[4] = {crc >> 24, crc >> 16, crc >> 8, crc};
+  fz_append_data(ctx, out, tail, 4);
+}
+
+// An RGB pixmap as PNG, with no row filter and zlib at level 1. This takes
+// about 9 ms for a page of 1200 pixels, and fz_new_buffer_from_pixmap_as_png
+// about 22 ms. The file is about 10 % bigger.
+static fz_buffer *fast_png(fz_context *ctx, fz_pixmap *pix)
+{
+  int w = pix->w, h = pix->h;
+  size_t row = (size_t)w * 3 + 1;
+  unsigned char *raw = fz_malloc(ctx, row * h);
+  uLongf zlen = compressBound(row * h);
+  unsigned char *z = NULL;
+  fz_buffer *out = NULL;
+  fz_var(z);
+  fz_var(out);
+  fz_try(ctx)
+  {
+    if (pix->n != 3)
+      fz_throw(ctx, FZ_ERROR_GENERIC, "fast_png needs RGB with no alpha");
+    for (int y = 0; y < h; y++)
+    {
+      raw[y * row] = 0;
+      memcpy(raw + y * row + 1, pix->samples + (size_t)y * pix->stride, row - 1);
+    }
+    z = fz_malloc(ctx, zlen);
+    if (compress2(z, &zlen, raw, row * h, 1) != Z_OK)
+      fz_throw(ctx, FZ_ERROR_GENERIC, "zlib compress2 failed");
+    out = fz_new_buffer(ctx, zlen + 64);
+    fz_append_data(ctx, out, "\x89PNG\r\n\x1a\n", 8);
+    unsigned char ihdr[13] = {w >> 24, w >> 16, w >> 8, w,
+                              h >> 24, h >> 16, h >> 8, h, 8, 2, 0, 0, 0};
+    png_chunk(ctx, out, "IHDR", ihdr, 13);
+    png_chunk(ctx, out, "IDAT", z, zlen);
+    png_chunk(ctx, out, "IEND", NULL, 0);
+  }
+  fz_always(ctx)
+  {
+    fz_free(ctx, raw);
+    fz_free(ctx, z);
+  }
+  fz_catch(ctx)
+  {
+    fz_drop_buffer(ctx, out);
+    fz_rethrow(ctx);
+  }
+  return out;
+}
+
+// The page request that waits for the engine. A new request replaces it.
+// used: a client sent render-page. Such a client shows no window, so the
+// process ends when its input ends, and no orphan stays.
+static struct {
+  bool pending, used;
+  int id, page;
+  float width;
+} page_request;
+
+// Send the requested page as a PNG image when the engine has shipped it.
+// An edit rolls the engine back, so a page below page_count has the new text.
+static void answer_page_request(struct persistent_state *ps, ui_state *ui)
+{
+  if (!page_request.pending)
+    return;
+  int count = send(page_count, ui->eng);
+  bool done = send(get_status, ui->eng) != DOC_RUNNING;
+  int page = page_request.page;
+  if (page >= count && !done)
+    return;
+  page_request.pending = false;
+  if (page >= count)
+  {
+    editor_page(page_request.id, -1, count, done, 0, 0, NULL, 0, 0);
+    return;
+  }
+
+  fz_context *ctx = ps->ctx;
+  fz_display_list *dl = NULL;
+  fz_pixmap *pix = NULL;
+  fz_buffer *png = NULL;
+  fz_var(dl);
+  fz_var(pix);
+  fz_var(png);
+  fz_try(ctx)
+  {
+    struct timespec t0, t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    dl = send(render_page, ui->eng, ctx, page);
+    fz_rect box = fz_bound_display_list(ctx, dl);
+    float w = box.x1 - box.x0;
+    float scale = (w > 0 && page_request.width > 0) ? page_request.width / w : 1;
+    pix = fz_new_pixmap_from_display_list(ctx, dl, fz_scale(scale, scale),
+                                          fz_device_rgb(ctx), 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    png = fast_png(ctx, pix);
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    editor_page(page_request.id, page, count, done, pix->w, pix->h, png,
+                (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+                (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6);
+  }
+  fz_always(ctx)
+  {
+    fz_drop_buffer(ctx, png);
+    fz_drop_pixmap(ctx, pix);
+    fz_drop_display_list(ctx, dl);
+  }
+  fz_catch(ctx)
+  {
+    fprintf(stderr, "[render-page] %s\n", fz_caught_message(ctx));
+    editor_page(page_request.id, -1, count, done, 0, 0, NULL, 0, 0);
+  }
+}
+
 #if !SDL_VERSION_ATLEAST(2, 0, 16)
 static void
 SDL_SetWindowAlwaysOnTop(SDL_Window *window, SDL_bool state)
@@ -1134,6 +1261,17 @@ static void interpret_command(struct persistent_state *ps,
       fprintf(stderr, "[command] rerun-once: pending immediate pass\n");
       schedule_event(SCAN_EVENT);
       break;
+
+    case EDIT_RENDER_PAGE:
+      // research-editor fork. The engine runs to this page (need_advance),
+      // and answer_page_request sends it. Apply the delayed changes first.
+      flush_changes(ps, ui);
+      page_request.pending = page_request.used = true;
+      page_request.id = cmd.render_page.id;
+      page_request.page = fz_maxi(0, cmd.render_page.page);
+      page_request.width = cmd.render_page.width;
+      ui->page = page_request.page;
+      break;
   }
 }
 
@@ -1334,6 +1472,8 @@ bool texpresso_main(struct persistent_state *ps)
       }
     }
     if (n == 0) stdin_eof = 1;
+    if (stdin_eof && page_request.used)
+      break; // research-editor fork: see page_request.used
 
     if (send(end_changes, ui->eng, ps->ctx))
     {
@@ -1349,6 +1489,7 @@ bool texpresso_main(struct persistent_state *ps)
       bool advance = !ps->paused && advance_engine(ps->ctx, ui);
       send(finish_convergence, ui->eng, ps->ctx);
       int after_page_count = send(page_count, ui->eng);
+      answer_page_request(ps, ui); // research-editor fork
       fflush(stdout);
 
       if (ui->page >= before_page_count && ui->page < after_page_count)

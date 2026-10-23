@@ -320,6 +320,26 @@ bool editor_parse(fz_context *ctx,
       goto arity;
     *out = (struct editor_command){.tag = EDIT_RERUN_ONCE, .rerun_once = {}};
   }
+  else if (strcmp(verb, "render-page") == 0)
+  {
+    // research-editor fork: (render-page id page width)
+    if (len != 4)
+      goto arity;
+    val id = val_array_get(ctx, stack, command, 1);
+    val page = val_array_get(ctx, stack, command, 2);
+    val width = val_array_get(ctx, stack, command, 3);
+    if (!val_is_number(id) || !val_is_number(page) || !val_is_number(width))
+      goto arguments;
+    *out = (struct editor_command){
+        .tag = EDIT_RENDER_PAGE,
+        .render_page =
+            {
+                .id = val_number(ctx, id),
+                .page = val_number(ctx, page),
+                .width = val_number(ctx, width),
+            },
+    };
+  }
   else
   {
     fprintf(stderr, "[command] unknown verb: %s\n", verb);
@@ -665,4 +685,51 @@ void editor_notify_lookup(const char *path,
     case EDITOR_SEXP: fprintf(stdout, "\")\n"); break;
     case EDITOR_JSON: fprintf(stdout, "\"]\n"); break;
   }
+}
+
+// research-editor fork: the reply to render-page, on one line.
+// (page id page count done width height "base64-png" draw-ms png-ms)
+void editor_page(int id, int page, int count, bool done,
+                 int width, int height, fz_buffer *png,
+                 float draw_ms, float png_ms)
+{
+  static const char digits[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+  switch (protocol)
+  {
+    case EDITOR_SEXP:
+      fprintf(stdout, "(page %d %d %d %s %d %d \"",
+              id, page, count, done ? "t" : "nil", width, height);
+      break;
+    case EDITOR_JSON:
+      fprintf(stdout, "[\"page\", %d, %d, %d, %s, %d, %d, \"",
+              id, page, count, done ? "true" : "false", width, height);
+      break;
+  }
+
+  // Base64 has no character that a string of either protocol must escape.
+  size_t len = png ? png->len : 0;
+  const unsigned char *p = png ? png->data : NULL;
+  for (size_t i = 0; i < len; i += 3)
+  {
+    unsigned v = p[i] << 16;
+    if (i + 1 < len) v |= p[i + 1] << 8;
+    if (i + 2 < len) v |= p[i + 2];
+    putc_unlocked(digits[(v >> 18) & 63], stdout);
+    putc_unlocked(digits[(v >> 12) & 63], stdout);
+    putc_unlocked(i + 1 < len ? digits[(v >> 6) & 63] : '=', stdout);
+    putc_unlocked(i + 2 < len ? digits[v & 63] : '=', stdout);
+  }
+
+  switch (protocol)
+  {
+    case EDITOR_SEXP:
+      fprintf(stdout, "\" %.1f %.1f)\n", draw_ms, png_ms);
+      break;
+    case EDITOR_JSON:
+      fprintf(stdout, "\", %.1f, %.1f]\n", draw_ms, png_ms);
+      break;
+  }
+  fflush(stdout);
 }
